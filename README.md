@@ -1,4 +1,4 @@
-*This project is not actively maintained.*
+TODO/Known bug: bounds for paths are currently calculated using simple min/max, this may clip/skew curved paths.
 
 Nano SVG
 ==========
