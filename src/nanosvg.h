@@ -129,8 +129,10 @@ typedef struct NSVGpaint {
 
 typedef struct NSVGpath
 {
-	float* pts;					// Cubic bezier points: x0,y0, [cpx1,cpx1,cpx2,cpy2,x1,y1], ...
-	int npts;					// Total number of bezier points.
+	uint8_t* cmds;
+	float* pts;					// Path points
+	int npts;					// Total number of points.
+	int ncmds;					// Total number of commands.
 	char closed;				// Flag indicating if shapes should be treated as closed.
 	float bounds[4];			// Tight bounding box of the shape [minx,miny,maxx,maxy].
 	struct NSVGpath* next;		// Pointer to next path, or NULL if last element.
@@ -381,6 +383,12 @@ enum NSVGunits {
 	NSVG_UNITS_EX
 };
 
+enum NSVpathCommand {
+	NSVG_PATH_MOVE_TO = 0,
+	NSVG_PATH_LINE_TO = 1,
+	NSVG_PATH_BEZIER  = 2
+};
+
 typedef struct NSVGcoordinate {
 	float value;
 	int units;
@@ -445,7 +453,10 @@ typedef struct NSVGparser
 	int attrHead;
 	float* pts;
 	int npts;
+	uint8_t* cmds;
+	int ncmds;
 	int cpts;
+	int ccmds;
 	NSVGpath* plist;
 	NSVGimage* image;
 	NSVGgradientData* gradients;
@@ -687,13 +698,15 @@ static void nsvg__deleteParser(NSVGparser* p)
 		nsvg__deleteGradientData(p->gradients);
 		nsvgDelete(p->image);
 		free(p->pts);
+		free(p->cmds);
 		free(p);
 	}
 }
 
 static void nsvg__resetPath(NSVGparser* p)
 {
-	p->npts = 0;
+	p->npts  = 0;
+	p->ncmds = 0;
 }
 
 static void nsvg__addPoint(NSVGparser* p, float x, float y)
@@ -708,26 +721,33 @@ static void nsvg__addPoint(NSVGparser* p, float x, float y)
 	p->npts++;
 }
 
+static void nsvg__addCommand(NSVGparser* p, NSVpathCommand command)
+{
+	if (p->ncmds + 1 > p->ccmds) {
+		p->ccmds = p->ccmds ? p->ccmds * 2 : 8;
+		p->cmds = (uint8_t*)realloc(p->cmds, p->ccmds);
+		if (!p->cmds) return;
+	}
+	p->cmds[p->ncmds] = (uint8_t)command;
+	p->ncmds++;
+}
+
 static void nsvg__moveTo(NSVGparser* p, float x, float y)
 {
 	if (p->npts > 0) {
-		p->pts[(p->npts-1)*2+0] = x;
-		p->pts[(p->npts-1)*2+1] = y;
-	} else {
+		p->pts[(p->npts - 1) * 2 + 0] = x;
+		p->pts[(p->npts - 1) * 2 + 1] = y;
+	}
+	else {
+		nsvg__addCommand(p, NSVG_PATH_MOVE_TO);
 		nsvg__addPoint(p, x, y);
 	}
 }
 
 static void nsvg__lineTo(NSVGparser* p, float x, float y)
 {
-	float px,py, dx,dy;
 	if (p->npts > 0) {
-		px = p->pts[(p->npts-1)*2+0];
-		py = p->pts[(p->npts-1)*2+1];
-		dx = x - px;
-		dy = y - py;
-		nsvg__addPoint(p, px + dx/3.0f, py + dy/3.0f);
-		nsvg__addPoint(p, x - dx/3.0f, y - dy/3.0f);
+		nsvg__addCommand(p, NSVG_PATH_LINE_TO);
 		nsvg__addPoint(p, x, y);
 	}
 }
@@ -735,6 +755,7 @@ static void nsvg__lineTo(NSVGparser* p, float x, float y)
 static void nsvg__cubicBezTo(NSVGparser* p, float cpx1, float cpy1, float cpx2, float cpy2, float x, float y)
 {
 	if (p->npts > 0) {
+		nsvg__addCommand(p, NSVG_PATH_BEZIER);
 		nsvg__addPoint(p, cpx1, cpy1);
 		nsvg__addPoint(p, cpx2, cpy2);
 		nsvg__addPoint(p, x, y);
@@ -1030,18 +1051,14 @@ static void nsvg__addPath(NSVGparser* p, char closed)
 {
 	NSVGattrib* attr = nsvg__getAttr(p);
 	NSVGpath* path = NULL;
-	float bounds[4];
-	float* curve;
 	int i;
+	float minx = 0.0f;
+	float miny = 0.0f;
+	float maxx = 0.0f;
+	float maxy = 0.0f;
+	float* point;
 
-	if (p->npts < 4)
-		return;
-
-	if (closed)
-		nsvg__lineTo(p, p->pts[0], p->pts[1]);
-
-	// Expect 1 + N*3 points (N = number of cubic bezier segments).
-	if ((p->npts % 3) != 1)
+	if (p->npts < 3)
 		return;
 
 	path = (NSVGpath*)malloc(sizeof(NSVGpath));
@@ -1053,26 +1070,58 @@ static void nsvg__addPath(NSVGparser* p, char closed)
 	path->closed = closed;
 	path->npts = p->npts;
 
+	path->cmds = (uint8_t*)malloc(p->ncmds);
+	if (path->cmds == NULL) goto error;
+	path->ncmds = p->ncmds;
+
 	// Transform path.
 	for (i = 0; i < p->npts; ++i)
 		nsvg__xformPoint(&path->pts[i*2], &path->pts[i*2+1], p->pts[i*2], p->pts[i*2+1], attr->xform);
 
+	for (i = 0; i < p->ncmds; ++i)
+		path->cmds[i] = p->cmds[i];
+
 	// Find bounds
-	for (i = 0; i < path->npts-1; i += 3) {
-		curve = &path->pts[i*2];
-		nsvg__curveBounds(bounds, curve);
+	//for (i = 0; i < path->npts-1; i += 3) {
+	//	curve = &path->pts[i*2];
+	//	nsvg__curveBounds(bounds, curve);
+	//	if (i == 0) {
+	//		path->bounds[0] = bounds[0];
+	//		path->bounds[1] = bounds[1];
+	//		path->bounds[2] = bounds[2];
+	//		path->bounds[3] = bounds[3];
+	//	} else {
+	//		path->bounds[0] = nsvg__minf(path->bounds[0], bounds[0]);
+	//		path->bounds[1] = nsvg__minf(path->bounds[1], bounds[1]);
+	//		path->bounds[2] = nsvg__maxf(path->bounds[2], bounds[2]);
+	//		path->bounds[3] = nsvg__maxf(path->bounds[3], bounds[3]);
+	//	}
+	//}
+
+	minx = 0.0f;
+	miny = 0.0f;
+	maxx = 0.0f;
+	maxy = 0.0f;
+
+	for (i = 0; i < path->npts; i++) {
+		point = &path->pts[i*2];
 		if (i == 0) {
-			path->bounds[0] = bounds[0];
-			path->bounds[1] = bounds[1];
-			path->bounds[2] = bounds[2];
-			path->bounds[3] = bounds[3];
+			minx = point[0];
+			miny = point[1];
+			maxx = point[2];
+			maxy = point[3];
 		} else {
-			path->bounds[0] = nsvg__minf(path->bounds[0], bounds[0]);
-			path->bounds[1] = nsvg__minf(path->bounds[1], bounds[1]);
-			path->bounds[2] = nsvg__maxf(path->bounds[2], bounds[2]);
-			path->bounds[3] = nsvg__maxf(path->bounds[3], bounds[3]);
+			minx = nsvg__minf(minx, point[0]);
+			miny = nsvg__minf(miny, point[1]);
+			maxx = nsvg__maxf(maxx, point[2]);
+			maxy = nsvg__maxf(maxy, point[3]);
 		}
 	}
+
+	path->bounds[0] = minx;
+	path->bounds[1] = miny;
+	path->bounds[2] = maxx;
+	path->bounds[3] = maxy;
 
 	path->next = p->plist;
 	p->plist = path;
@@ -3062,6 +3111,11 @@ NSVGpath* nsvgDuplicatePath(NSVGpath* p)
     if (res->pts == NULL) goto error;
     memcpy(res->pts, p->pts, p->npts * sizeof(float) * 2);
     res->npts = p->npts;
+
+	res->cmds = (uint8_t*)malloc(p->ncmds);
+	if (res->cmds == NULL) goto error;
+	memcpy(res->cmds, p->cmds, p->ncmds);
+	res->ncmds = p->ncmds;
 
     memcpy(res->bounds, p->bounds, sizeof(p->bounds));
 
