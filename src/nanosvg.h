@@ -673,6 +673,8 @@ static void nsvg__deletePaths(NSVGpath* path)
 		NSVGpath* next = path->next;
 		if (path->pts != NULL)
 			free(path->pts);
+		if (path->cmds != NULL)
+			free(path->cmds);
 		free(path);
 		path = next;
 	}
@@ -750,28 +752,22 @@ static void nsvg__moveTo(NSVGparser* p, float x, float y)
 
 static void nsvg__lineTo(NSVGparser* p, float x, float y)
 {
-	float px, py, dx, dy;
-	if (p->npts > 0) {
-		nsvg__addCommand(p, NSVG_DRAW_LINE_TO);
+	if (p->npts == 0)
+		return;
 
-		px = p->pts[(p->npts - 1) * 2 + 0];
-		py = p->pts[(p->npts - 1) * 2 + 1];
-		dx = x - px;
-		dy = y - py;
-		nsvg__addPoint(p, px + dx / 3.0f, py + dy / 3.0f);
-		nsvg__addPoint(p, x - dx / 3.0f, y - dy / 3.0f);
-		nsvg__addPoint(p, x, y);
-	}
+	nsvg__addCommand(p, NSVG_DRAW_LINE_TO);
+	nsvg__addPoint(p, x, y);
 }
 
 static void nsvg__cubicBezTo(NSVGparser* p, float cpx1, float cpy1, float cpx2, float cpy2, float x, float y)
 {
-	if (p->npts > 0) {
-		nsvg__addCommand(p, NSVG_DRAW_BEZIER_TO);
-		nsvg__addPoint(p, cpx1, cpy1);
-		nsvg__addPoint(p, cpx2, cpy2);
-		nsvg__addPoint(p, x, y);
-	}
+	if (p->npts == 0)
+		return;
+
+	nsvg__addCommand(p, NSVG_DRAW_BEZIER_TO);
+	nsvg__addPoint(p, cpx1, cpy1);
+	nsvg__addPoint(p, cpx2, cpy2);
+	nsvg__addPoint(p, x, y);
 }
 
 static NSVGattrib* nsvg__getAttr(NSVGparser* p)
@@ -1080,10 +1076,6 @@ static void nsvg__addPath(NSVGparser* p, char closed)
 	if (closed)
 		nsvg__lineTo(p, p->pts[0], p->pts[1]);
 
-	// Expect 1 + N*3 points (N = number of cubic bezier segments).
-	if ((p->npts % 3) != 1)
-		return;
-
 	path = (NSVGpath*)malloc(sizeof(NSVGpath));
 	if (path == NULL) goto error;
 	memset(path, 0, sizeof(NSVGpath));
@@ -1096,28 +1088,28 @@ static void nsvg__addPath(NSVGparser* p, char closed)
 	path->cmds = (char*)malloc(p->ncmds);
 	if (path->cmds == NULL) goto error;
 	path->ncmds = p->ncmds;
-	memcpy(path->cmds, p->cmds, p->ncmds);
+
+	for (i = 0; i < p->ncmds; ++i)
+		path->cmds[i] = p->cmds[i];
 
 	// Transform path.
 	for (i = 0; i < p->npts; ++i)
 		nsvg__xformPoint(&path->pts[i * 2], &path->pts[i * 2 + 1], p->pts[i * 2], p->pts[i * 2 + 1], attr->xform);
 
 	// Find bounds
-	for (i = 0; i < path->npts - 1; i += 3) {
+	path->bounds[0] =  FLT_MAX;
+	path->bounds[1] =  FLT_MAX;
+	path->bounds[2] = -FLT_MAX;
+	path->bounds[3] = -FLT_MAX;
+
+	for (i=0; i<path->npts; ++i)
+	{
 		curve = &path->pts[i * 2];
-		nsvg__curveBounds(bounds, curve);
-		if (i == 0) {
-			path->bounds[0] = bounds[0];
-			path->bounds[1] = bounds[1];
-			path->bounds[2] = bounds[2];
-			path->bounds[3] = bounds[3];
-		}
-		else {
-			path->bounds[0] = nsvg__minf(path->bounds[0], bounds[0]);
-			path->bounds[1] = nsvg__minf(path->bounds[1], bounds[1]);
-			path->bounds[2] = nsvg__maxf(path->bounds[2], bounds[2]);
-			path->bounds[3] = nsvg__maxf(path->bounds[3], bounds[3]);
-		}
+		path->bounds[0] = nsvg__minf(path->bounds[0], curve[0]);
+		path->bounds[1] = nsvg__minf(path->bounds[1], curve[1]);
+		path->bounds[2] = nsvg__maxf(path->bounds[2], curve[0]);
+		path->bounds[3] = nsvg__maxf(path->bounds[3], curve[1]);
+		//nsvg__curveBounds(bounds, curve);
 	}
 
 	path->next = p->plist;
@@ -1128,6 +1120,7 @@ static void nsvg__addPath(NSVGparser* p, char closed)
 error:
 	if (path != NULL) {
 		if (path->pts != NULL) free(path->pts);
+		if (path->cmds != NULL) free(path->cmds);
 		free(path);
 	}
 }
@@ -3200,6 +3193,7 @@ NSVGpath* nsvgDuplicatePath(NSVGpath* p)
 error:
 	if (res != NULL) {
 		free(res->pts);
+		free(res->cmds);
 		free(res);
 	}
 	return NULL;
