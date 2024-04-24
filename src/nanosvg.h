@@ -1066,7 +1066,6 @@ static void nsvg__addPath(NSVGparser* p, char closed)
 {
 	NSVGattrib* attr = nsvg__getAttr(p);
 	NSVGpath* path = NULL;
-	float bounds[4];
 	float* curve;
 	int i;
 
