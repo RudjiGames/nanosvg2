@@ -71,45 +71,60 @@ extern "C" {
 		nsvgDelete(image);
 	*/
 
+	enum NSVShapeType {
+		NSVG_SHAPE_TYPE_POLYGON		= 0,
+		NSVG_SHAPE_TYPE_LINE		= 1,
+		NSVG_SHAPE_TYPE_PATH		= 2,
+		NSVG_SHAPE_TYPE_RECT		= 3,
+		NSVG_SHAPE_TYPE_CIRCLE		= 4,
+		NSVG_SHAPE_TYPE_ELLIPSE		= 5
+	};
+
+	enum NSVPathOrientation {
+		NSVG_PATH_CCW				= 0,
+		NSVG_PATH_CW				= 1
+	};
+
 	enum NSVDrawCommand {
-		NSVG_DRAW_MOVE_TO = 0,
-		NSVG_DRAW_LINE_TO = 1,
-		NSVG_DRAW_BEZIER_TO = 2
+		NSVG_DRAW_MOVE_TO			= 0,
+		NSVG_DRAW_LINE_TO			= 1,
+		NSVG_DRAW_BEZIER_TO			= 2
 	};
 
 	enum NSVGpaintType {
-		NSVG_PAINT_UNDEF = -1,
-		NSVG_PAINT_NONE = 0,
-		NSVG_PAINT_COLOR = 1,
-		NSVG_PAINT_LINEAR_GRADIENT = 2,
-		NSVG_PAINT_RADIAL_GRADIENT = 3
+		NSVG_PAINT_UNDEF			= -1,
+		NSVG_PAINT_NONE				= 0,
+		NSVG_PAINT_COLOR			= 1,
+		NSVG_PAINT_LINEAR_GRADIENT	= 2,
+		NSVG_PAINT_RADIAL_GRADIENT	= 3
 	};
 
 	enum NSVGspreadType {
-		NSVG_SPREAD_PAD = 0,
-		NSVG_SPREAD_REFLECT = 1,
-		NSVG_SPREAD_REPEAT = 2
+		NSVG_SPREAD_PAD				= 0,
+		NSVG_SPREAD_REFLECT			= 1,
+		NSVG_SPREAD_REPEAT			= 2
 	};
 
 	enum NSVGlineJoin {
-		NSVG_JOIN_MITER = 0,
-		NSVG_JOIN_ROUND = 1,
-		NSVG_JOIN_BEVEL = 2
+		NSVG_JOIN_MITER				= 0,
+		NSVG_JOIN_ROUND				= 1,
+		NSVG_JOIN_BEVEL				= 2
 	};
 
 	enum NSVGlineCap {
-		NSVG_CAP_BUTT = 0,
-		NSVG_CAP_ROUND = 1,
-		NSVG_CAP_SQUARE = 2
+		NSVG_CAP_BUTT				= 0,
+		NSVG_CAP_ROUND				= 1,
+		NSVG_CAP_SQUARE				= 2
 	};
 
 	enum NSVGfillRule {
-		NSVG_FILLRULE_NONZERO = 0,
-		NSVG_FILLRULE_EVENODD = 1
+		NSVG_FILLRULE_NONZERO		= 0,
+		NSVG_FILLRULE_EVENODD		= 1
 	};
 
 	enum NSVGflags {
-		NSVG_FLAGS_VISIBLE = 0x01
+		NSVG_FLAGS_VISIBLE			= 0x01,
+		NSVG_FLAGS_POLYGON			= 0x02
 	};
 
 	typedef struct NSVGgradientStop {
@@ -140,6 +155,7 @@ extern "C" {
 		char* cmds;					// Draw commands
 		int ncmds;					// Total number of draw commands
 		char closed;				// Flag indicating if shapes should be treated as closed.
+		char type;					// Shape type.
 		float bounds[4];			// Tight bounding box of the shape [minx,miny,maxx,maxy].
 		struct NSVGpath* next;		// Pointer to next path, or NULL if last element.
 	} NSVGpath;
@@ -183,6 +199,9 @@ extern "C" {
 
 	// Duplicates a path.
 	NSVGpath* nsvgDuplicatePath(NSVGpath* p);
+
+	// Changes path orientation to CW
+	NSVGpath* nsvgDuplicatePathWithOrientation(NSVGpath* p, char orientation);
 
 	// Deletes an image.
 	void nsvgDelete(NSVGimage* image);
@@ -1062,7 +1081,7 @@ error:
 	if (shape) free(shape);
 }
 
-static void nsvg__addPath(NSVGparser* p, char closed)
+static void nsvg__addPath(NSVGparser* p, char closed, char type)
 {
 	NSVGattrib* attr = nsvg__getAttr(p);
 	NSVGpath* path = NULL;
@@ -1078,6 +1097,7 @@ static void nsvg__addPath(NSVGparser* p, char closed)
 	path = (NSVGpath*)malloc(sizeof(NSVGpath));
 	if (path == NULL) goto error;
 	memset(path, 0, sizeof(NSVGpath));
+	path->type = type;
 
 	path->pts = (float*)malloc(p->npts * 2 * sizeof(float));
 	if (path->pts == NULL) goto error;
@@ -2435,7 +2455,7 @@ static void nsvg__parsePath(NSVGparser* p, const char** attr)
 				if (cmd == 'M' || cmd == 'm') {
 					// Commit path.
 					if (p->npts > 0)
-						nsvg__addPath(p, closedFlag);
+						nsvg__addPath(p, closedFlag, NSVG_SHAPE_TYPE_PATH);
 					// Start new subpath.
 					nsvg__resetPath(p);
 					closedFlag = 0;
@@ -2453,7 +2473,7 @@ static void nsvg__parsePath(NSVGparser* p, const char** attr)
 						cpx = p->pts[0];
 						cpy = p->pts[1];
 						cpx2 = cpx; cpy2 = cpy;
-						nsvg__addPath(p, closedFlag);
+						nsvg__addPath(p, closedFlag, NSVG_SHAPE_TYPE_PATH);
 					}
 					// Start new subpath.
 					nsvg__resetPath(p);
@@ -2471,7 +2491,7 @@ static void nsvg__parsePath(NSVGparser* p, const char** attr)
 		}
 		// Commit path.
 		if (p->npts)
-			nsvg__addPath(p, closedFlag);
+			nsvg__addPath(p, closedFlag, NSVG_SHAPE_TYPE_PATH);
 	}
 
 	nsvg__addShape(p);
@@ -2527,7 +2547,7 @@ static void nsvg__parseRect(NSVGparser* p, const char** attr)
 			nsvg__cubicBezTo(p, x, y + ry * (1 - NSVG_KAPPA90), x + rx * (1 - NSVG_KAPPA90), y, x + rx, y);
 		}
 
-		nsvg__addPath(p, 1);
+		nsvg__addPath(p, 1, NSVG_SHAPE_TYPE_RECT);
 
 		nsvg__addShape(p);
 	}
@@ -2557,7 +2577,7 @@ static void nsvg__parseCircle(NSVGparser* p, const char** attr)
 		nsvg__cubicBezTo(p, cx - r, cy - r * NSVG_KAPPA90, cx - r * NSVG_KAPPA90, cy - r, cx, cy - r);
 		nsvg__cubicBezTo(p, cx + r * NSVG_KAPPA90, cy - r, cx + r, cy - r * NSVG_KAPPA90, cx + r, cy);
 
-		nsvg__addPath(p, 1);
+		nsvg__addPath(p, 1, NSVG_SHAPE_TYPE_CIRCLE);
 
 		nsvg__addShape(p);
 	}
@@ -2590,7 +2610,7 @@ static void nsvg__parseEllipse(NSVGparser* p, const char** attr)
 		nsvg__cubicBezTo(p, cx - rx, cy - ry * NSVG_KAPPA90, cx - rx * NSVG_KAPPA90, cy - ry, cx, cy - ry);
 		nsvg__cubicBezTo(p, cx + rx * NSVG_KAPPA90, cy - ry, cx + rx, cy - ry * NSVG_KAPPA90, cx + rx, cy);
 
-		nsvg__addPath(p, 1);
+		nsvg__addPath(p, 1, NSVG_SHAPE_TYPE_ELLIPSE);
 
 		nsvg__addShape(p);
 	}
@@ -2618,7 +2638,7 @@ static void nsvg__parseLine(NSVGparser* p, const char** attr)
 	nsvg__moveTo(p, x1, y1);
 	nsvg__lineTo(p, x2, y2);
 
-	nsvg__addPath(p, 0);
+	nsvg__addPath(p, 0, NSVG_SHAPE_TYPE_LINE);
 
 	nsvg__addShape(p);
 }
@@ -2654,7 +2674,7 @@ static void nsvg__parsePoly(NSVGparser* p, const char** attr, int closeFlag)
 		}
 	}
 
-	nsvg__addPath(p, (char)closeFlag);
+	nsvg__addPath(p, (char)closeFlag, NSVG_SHAPE_TYPE_POLYGON);
 
 	nsvg__addShape(p);
 }
@@ -3197,6 +3217,96 @@ error:
 	}
 	return NULL;
 }
+
+static void nvsg__getCommandEndPoint(float* x, float* y, char command, float** p)
+{
+	float* pts = *p;
+
+	switch (command) {
+	case NSVG_DRAW_MOVE_TO:		*x = pts[0]; *y = pts[1]; *p = pts + 2; break;
+	case NSVG_DRAW_LINE_TO:		*x = pts[0]; *y = pts[1]; *p = pts + 2; break;
+	case NSVG_DRAW_BEZIER_TO:	*x = pts[4]; *y = pts[5]; *p = pts + 6; break;
+	};
+}
+
+int nsvg__getPointIndex(NSVGpath* p, int commandIndex)
+{
+	int i, index = 0;
+	for (i=0; i<commandIndex; i++) {
+		if (p->cmds[i] == NSVG_DRAW_BEZIER_TO)
+			index += 6;
+		else
+			index += 2;
+	}
+	return index;
+}
+
+NSVGpath* nsvgDuplicatePathWithOrientation(NSVGpath* p, char orientation)
+{
+	NSVGpath* res = NULL;
+	float x0, y0, x1, y1, x2, y2;
+	float* pts = p->pts;
+	float* src_pts;
+	float* dst_pts;
+
+	if (p->ncmds < 3)
+		return NULL;
+
+	if (p->cmds[0] != NSVG_DRAW_MOVE_TO)
+		return NULL; // can't flip
+
+	if (p == NULL)
+		return NULL;
+
+	// find orientation of original path
+	nvsg__getCommandEndPoint(&x0, &y0, p->cmds[0], &pts);
+	nvsg__getCommandEndPoint(&x1, &y1, p->cmds[1], &pts);
+	nvsg__getCommandEndPoint(&x2, &y2, p->cmds[2], &pts);
+
+	float det = (x1*y2 + x0*y1 + y0*x2) - (y0*x1 + y1*x2 + x0*y2);
+
+	res = nsvgDuplicatePath(p);
+
+	// no need to change orientation, return duplicate
+	if ((det < 0.0f) && (orientation == NSVG_PATH_CW))
+		return res;
+
+	if (p->type == NSVG_SHAPE_TYPE_PATH)
+		return res;
+
+	// Example:
+	// MOVE_TO -> LINE_TO -> BEZIER_TO
+	// Should become:
+	// MOVE_TO -> BEZIER_TO -> LINE_TO
+
+	// to get the same curve backwards, first command stays 'move to'
+	// the rest of commands are reversed
+	src_pts = p->pts;
+	dst_pts = res->pts;
+	for (int i=0; i<p->ncmds-1; i++)
+	{
+		const int srcCommandIndex = i == 0 ? 0 : p->ncmds - i;
+		res->cmds[i] = p->cmds[srcCommandIndex];
+	}
+
+	// reverse points
+	for (int i=0; i<p->npts-1; i++)
+	{
+		res->pts[i*2+0] = p->pts[(p->npts-1-i)*2+0];
+		res->pts[i*2+1] = p->pts[(p->npts-1-i)*2+1];
+	}
+
+	return res;
+
+error:
+	if (res != NULL) {
+		free(res->pts);
+		free(res->cmds);
+		free(res);
+	}
+	return NULL;
+}
+
 
 void nsvgDelete(NSVGimage* image)
 {
