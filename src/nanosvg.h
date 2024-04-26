@@ -203,6 +203,9 @@ extern "C" {
 	// Changes path orientation to CW
 	NSVGpath* nsvgDuplicatePathWithOrientation(NSVGpath* p, char orientation);
 
+	// Optimizes path by removing points on straight lines
+	void nsvgOptimizePath(NSVGpath* p);
+
 	// Deletes an image.
 	void nsvgDelete(NSVGimage* image);
 
@@ -3326,6 +3329,71 @@ NSVGpath* nsvgDuplicatePathWithOrientation(NSVGpath* p, char orientation)
 	}
 
 	return res;
+}
+
+void nsvgOptimizePath(NSVGpath* p)
+{
+	int i;
+	float v1x, v1y, v2x, v2y;
+	float* oldpts = p->pts;
+	int numcmds = 0;
+	int numpts = 0;
+	float* newpts;
+	char*  newcmd;
+
+	if (p->cmds[0] != NSVG_DRAW_MOVE_TO)
+		return;
+
+	newpts = (float*)malloc(sizeof(float) * p->npts * 2);
+	newcmd = (char*)malloc(sizeof(char) * p->ncmds);
+
+	for (i=0; i<p->ncmds; i++)
+	{
+		newcmd[numcmds++] = p->cmds[i];
+
+		if ((p->cmds[i] == NSVG_DRAW_LINE_TO) && (i<p->ncmds-1) && (p->cmds[i] == p->cmds[i+1]))
+		{
+			v1x = oldpts[2] - oldpts[-2];
+			v1y = oldpts[3] - oldpts[-1];
+			v2x = oldpts[0] - oldpts[-2];
+			v2y = oldpts[1] - oldpts[-1];
+
+			newpts[numpts++] = oldpts[0];
+			newpts[numpts++] = oldpts[1];
+			oldpts += 2;
+
+			if (fabsf((v1x / v1y) - (v2x / v2y)) < 0.0001f)
+			{
+				newpts[numpts-2] = oldpts[0];
+				newpts[numpts-1] = oldpts[1];
+				oldpts += 2;
+				++i;
+			}
+		}
+		else
+		{
+			newpts[numpts++]  = oldpts[0];
+			newpts[numpts++]  = oldpts[1];
+
+			if (p->cmds[i] == NSVG_DRAW_BEZIER_TO)
+			{
+				newpts[numpts++] = oldpts[2];
+				newpts[numpts++] = oldpts[3];
+				newpts[numpts++] = oldpts[4];
+				newpts[numpts++] = oldpts[5];
+				oldpts += 4;
+			}
+			oldpts += 2;
+		}
+	}
+
+	free(p->cmds);
+	free(p->pts);
+
+	p->ncmds = numcmds;
+	p->cmds  = newcmd;
+	p->npts  = numpts >> 1;
+	p->pts   = newpts;
 }
 
 void nsvgDelete(NSVGimage* image)
