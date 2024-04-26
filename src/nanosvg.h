@@ -1085,8 +1085,11 @@ static void nsvg__addPath(NSVGparser* p, char closed, char type)
 {
 	NSVGattrib* attr = nsvg__getAttr(p);
 	NSVGpath* path = NULL;
-	float* curve;
+	float prevx, prevy;
+	float* pts;
 	int i;
+	float bounds[4];
+	float curve[8];
 
 	if (p->npts < 4)
 		return;
@@ -1121,14 +1124,50 @@ static void nsvg__addPath(NSVGparser* p, char closed, char type)
 	path->bounds[2] = -FLT_MAX;
 	path->bounds[3] = -FLT_MAX;
 
-	for (i=0; i<path->npts; ++i)
+	pts = path->pts;
+	prevx = pts[0];
+	prevy = pts[1];
+	for (i=0; i<path->ncmds; ++i)
 	{
-		curve = &path->pts[i * 2];
-		path->bounds[0] = nsvg__minf(path->bounds[0], curve[0]);
-		path->bounds[1] = nsvg__minf(path->bounds[1], curve[1]);
-		path->bounds[2] = nsvg__maxf(path->bounds[2], curve[0]);
-		path->bounds[3] = nsvg__maxf(path->bounds[3], curve[1]);
-		//nsvg__curveBounds(bounds, curve);
+		switch (path->cmds[i])
+		{
+			case NSVG_DRAW_MOVE_TO:
+				path->bounds[0] = nsvg__minf(path->bounds[0], pts[0]);
+				path->bounds[1] = nsvg__minf(path->bounds[1], pts[1]);
+				path->bounds[2] = nsvg__maxf(path->bounds[2], pts[0]);
+				path->bounds[3] = nsvg__maxf(path->bounds[3], pts[1]);
+				prevx = pts[0];
+				prevy = pts[1];
+				pts += 2;
+				break;
+
+			case NSVG_DRAW_LINE_TO:
+				path->bounds[0] = nsvg__minf(path->bounds[0], pts[0]);
+				path->bounds[1] = nsvg__minf(path->bounds[1], pts[1]);
+				path->bounds[2] = nsvg__maxf(path->bounds[2], pts[0]);
+				path->bounds[3] = nsvg__maxf(path->bounds[3], pts[1]);
+				prevx = pts[0];
+				prevy = pts[1];
+				pts += 2;
+				break;
+
+			case NSVG_DRAW_BEZIER_TO:
+				curve[0] = prevx;
+				curve[1] = prevy;
+				curve[2] = pts[0];
+				curve[3] = pts[1];
+				curve[4] = pts[2];
+				curve[5] = pts[3];
+				curve[6] = pts[4];
+				curve[7] = pts[5];
+				nsvg__curveBounds(bounds, curve);
+				path->bounds[0] = nsvg__minf(path->bounds[0], bounds[0]);
+				path->bounds[1] = nsvg__minf(path->bounds[1], bounds[1]);
+				path->bounds[2] = nsvg__maxf(path->bounds[2], bounds[2]);
+				path->bounds[3] = nsvg__maxf(path->bounds[3], bounds[3]);
+				pts += 6;
+				break;
+		};
 	}
 
 	path->next = p->plist;
@@ -3229,18 +3268,6 @@ static void nvsg__getCommandEndPoint(float* x, float* y, char command, float** p
 	};
 }
 
-int nsvg__getPointIndex(NSVGpath* p, int commandIndex)
-{
-	int i, index = 0;
-	for (i=0; i<commandIndex; i++) {
-		if (p->cmds[i] == NSVG_DRAW_BEZIER_TO)
-			index += 6;
-		else
-			index += 2;
-	}
-	return index;
-}
-
 NSVGpath* nsvgDuplicatePathWithOrientation(NSVGpath* p, char orientation)
 {
 	NSVGpath* res = NULL;
@@ -3297,16 +3324,7 @@ NSVGpath* nsvgDuplicatePathWithOrientation(NSVGpath* p, char orientation)
 	}
 
 	return res;
-
-error:
-	if (res != NULL) {
-		free(res->pts);
-		free(res->cmds);
-		free(res);
-	}
-	return NULL;
 }
-
 
 void nsvgDelete(NSVGimage* image)
 {
