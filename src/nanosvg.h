@@ -3275,6 +3275,8 @@ NSVGpath* nsvgDuplicatePathWithOrientation(NSVGpath* p, char orientation)
 	float* pts = p->pts;
 	float* src_pts;
 	float* dst_pts;
+	int i;
+	float det;
 
 	if (p->ncmds < 3)
 		return NULL;
@@ -3290,7 +3292,7 @@ NSVGpath* nsvgDuplicatePathWithOrientation(NSVGpath* p, char orientation)
 	nvsg__getCommandEndPoint(&x1, &y1, p->cmds[1], &pts);
 	nvsg__getCommandEndPoint(&x2, &y2, p->cmds[2], &pts);
 
-	float det = (x1*y2 + x0*y1 + y0*x2) - (y0*x1 + y1*x2 + x0*y2);
+	det = (x1*y2 + x0*y1 + y0*x2) - (y0*x1 + y1*x2 + x0*y2);
 
 	res = nsvgDuplicatePath(p);
 
@@ -3310,14 +3312,14 @@ NSVGpath* nsvgDuplicatePathWithOrientation(NSVGpath* p, char orientation)
 	// the rest of commands are reversed
 	src_pts = p->pts;
 	dst_pts = res->pts;
-	for (int i=0; i<p->ncmds-1; i++)
+	for (i=0; i<p->ncmds-1; i++)
 	{
 		const int srcCommandIndex = i == 0 ? 0 : p->ncmds - i;
 		res->cmds[i] = p->cmds[srcCommandIndex];
 	}
 
 	// reverse points
-	for (int i=0; i<p->npts-1; i++)
+	for (i=0; i<p->npts-1; i++)
 	{
 		res->pts[i*2+0] = p->pts[(p->npts-1-i)*2+0];
 		res->pts[i*2+1] = p->pts[(p->npts-1-i)*2+1];
