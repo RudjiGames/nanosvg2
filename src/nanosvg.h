@@ -3282,10 +3282,10 @@ NSVGpath* nsvgDuplicatePathWithOrientation(NSVGpath* p, char orientation)
 	float det;
 
 	if (p->ncmds < 3)
-		return NULL;
+		return nsvgDuplicatePath(p);
 
 	if (p->cmds[0] != NSVG_DRAW_MOVE_TO)
-		return NULL; // can't flip
+		return nsvgDuplicatePath(p); // can't flip
 
 	if (p == NULL)
 		return NULL;
