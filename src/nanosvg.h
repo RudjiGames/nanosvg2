@@ -29,6 +29,11 @@
 #ifndef NANOSVG_H
 #define NANOSVG_H
 
+#ifdef _MSC_VER
+#pragma warning (disable: 4456) // declaration of '' hides previous local declaration
+#pragma warning (disable: 4702) // unreachable code
+#endif
+
 #ifndef NANOSVG_CPLUSPLUS
 #ifdef __cplusplus
 extern "C" {
@@ -1294,7 +1299,7 @@ static unsigned int nsvg__parseColorRGB(const char* str)
 			while (*str && (nsvg__isspace(*str))) str++; 	// skip leading spaces
 			if (*str == '+') str++;				// skip '+' (don't allow '-')
 			if (!*str) break;
-			rgbf[i] = nsvg__atof(str);
+			rgbf[i] = (float)nsvg__atof(str);
 
 			// Note 1: it would be great if nsvg__atof() returned how many
 			// bytes it consumed but it doesn't. We need to skip the number,
@@ -1316,9 +1321,9 @@ static unsigned int nsvg__parseColorRGB(const char* str)
 			else break;
 		}
 		if (i == 3) {
-			rgbi[0] = roundf(rgbf[0] * 2.55f);
-			rgbi[1] = roundf(rgbf[1] * 2.55f);
-			rgbi[2] = roundf(rgbf[2] * 2.55f);
+			rgbi[0] = (unsigned int)roundf(rgbf[0] * 2.55f);
+			rgbi[1] = (unsigned int)roundf(rgbf[1] * 2.55f);
+			rgbi[2] = (unsigned int)roundf(rgbf[2] * 2.55f);
 		} else {
 			rgbi[0] = rgbi[1] = rgbi[2] = 128;
 		}
@@ -1556,7 +1561,7 @@ static unsigned int nsvg__parseColor(const char* str)
 
 static float nsvg__parseOpacity(const char* str)
 {
-	float val = nsvg__atof(str);
+	float val = (float)nsvg__atof(str);
 	if (val < 0.0f) val = 0.0f;
 	if (val > 1.0f) val = 1.0f;
 	return val;
@@ -1564,7 +1569,7 @@ static float nsvg__parseOpacity(const char* str)
 
 static float nsvg__parseMiterLimit(const char* str)
 {
-	float val = nsvg__atof(str);
+	float val = (float)nsvg__atof(str);
 	if (val < 0.0f) val = 0.0f;
 	return val;
 }
@@ -1606,7 +1611,7 @@ static NSVGcoordinate nsvg__parseCoordinateRaw(const char* str)
 	NSVGcoordinate coord = {0, NSVG_UNITS_USER};
 	char buf[64];
 	coord.units = nsvg__parseUnits(nsvg__parseNumber(str, buf, 64));
-	coord.value = nsvg__atof(buf);
+	coord.value = (float)nsvg__atof(buf);
 	return coord;
 }
 
@@ -1887,7 +1892,7 @@ static int nsvg__parseAttr(NSVGparser* p, const char* name, const char* value)
 			// if the fillColor has an alpha value then use it to
 						// set the fillOpacity
 			if (attr->fillColor & 0xFF000000) {
-				attr->fillOpacity = ((attr->fillColor >> 24) & 0xFF) / 255.0;
+				attr->fillOpacity = ((attr->fillColor >> 24) & 0xFF) / 255.0f;
 				// remove the alpha value from the color
 				attr->fillColor &= 0x00FFFFFF;
 			}
@@ -1908,7 +1913,7 @@ static int nsvg__parseAttr(NSVGparser* p, const char* name, const char* value)
 			// if the strokeColor has an alpha value then use it to
 			// set the strokeOpacity
 			if (attr->strokeColor & 0xFF000000) {
-				attr->strokeOpacity = ((attr->strokeColor >> 24) & 0xFF) / 255.0;
+				attr->strokeOpacity = ((attr->strokeColor >> 24) & 0xFF) / 255.0f;
 				// remove the alpha value from the color
 				attr->strokeColor &= 0x00FFFFFF;
 			}
@@ -2708,19 +2713,19 @@ static void nsvg__parseSVG(NSVGparser* p, const char** attr)
 				const char *s = attr[i + 1];
 				char buf[64];
 				s = nsvg__parseNumber(s, buf, 64);
-				p->viewMinx = nsvg__atof(buf);
+				p->viewMinx = (float)nsvg__atof(buf);
 				while (*s && (nsvg__isspace(*s) || *s == '%' || *s == ',')) s++;
 				if (!*s) return;
 				s = nsvg__parseNumber(s, buf, 64);
-				p->viewMiny = nsvg__atof(buf);
+				p->viewMiny = (float)nsvg__atof(buf);
 				while (*s && (nsvg__isspace(*s) || *s == '%' || *s == ',')) s++;
 				if (!*s) return;
 				s = nsvg__parseNumber(s, buf, 64);
-				p->viewWidth = nsvg__atof(buf);
+				p->viewWidth = (float)nsvg__atof(buf);
 				while (*s && (nsvg__isspace(*s) || *s == '%' || *s == ',')) s++;
 				if (!*s) return;
 				s = nsvg__parseNumber(s, buf, 64);
-				p->viewHeight = nsvg__atof(buf);
+				p->viewHeight = (float)nsvg__atof(buf);
 			} else if (strcmp(attr[i], "preserveAspectRatio") == 0) {
 				if (strstr(attr[i + 1], "none") != 0) {
 					// No uniform scaling
