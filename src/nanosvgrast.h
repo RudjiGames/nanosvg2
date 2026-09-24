@@ -908,7 +908,7 @@ static void nsvg__freeActive(NSVGrasterizer* r, NSVGactiveEdge* z)
 
 // Partial coverage at the span ends is added to 'scanline', fully covered pixels
 // between them are recorded as start/end deltas in 'spans' and accumulated
-// once per pixel row, see nsvg__accumulateSpans().
+// once per pixel row, see nsvg__coverage1().
 static void nsvg__fillScanline(unsigned char* scanline, int* spans, int len, int x0, int x1, int maxWeight, int* xmin, int* xmax)
 {
 	int i = x0 >> NSVG__FIXSHIFT;
@@ -1006,6 +1006,11 @@ static unsigned int nsvg__applyOpacity(unsigned int c, float u)
 	return nsvg__RGBA((unsigned char)r, (unsigned char)g, (unsigned char)b, (unsigned char)a);
 }
 
+#if !defined(NSVG_NO_SIMD) && (defined(__SSE2__) || defined(_M_X64) || defined(_M_AMD64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2))
+#define NSVG__SSE2 1
+#include <emmintrin.h>
+#endif
+
 static inline int nsvg__div255(int x)
 {
     return ((x+1) * 257) >> 16;
@@ -1047,17 +1052,124 @@ static inline void nsvg__blendPixel(unsigned char* dst, unsigned int c, int cove
 	dst[3] = (unsigned char)a;
 }
 
+#ifdef NSVG__SSE2
+// Blends 4 colors (RGBA, one per 32 bit lane) with 4 coverage values over 4
+// premultiplied pixels. Computes exactly the same as nsvg__blendPixel():
+// div255(x) = ((x+1)*257)>>16 is a single _mm_mulhi_epu16(x+1, 257), and
+// pixels with zero coverage or full opacity produce the same results as the
+// scalar early outs.
+static inline __m128i nsvg__div255x8(__m128i x)
+{
+	return _mm_mulhi_epu16(_mm_add_epi16(x, _mm_set1_epi16(1)), _mm_set1_epi16(257));
+}
+
+static inline void nsvg__blend4(unsigned char* dst, __m128i colors, unsigned int cover4)
+{
+	const __m128i zero = _mm_setzero_si128();
+	__m128i cov, ca, a, alo, ahi, c, clo, chi, d, dlo, dhi, ia;
+
+	// a = div255(cover * ca), for the 4 pixels in the low 16 bit lanes
+	cov = _mm_unpacklo_epi8(_mm_cvtsi32_si128((int)cover4), zero);
+	ca = _mm_srli_epi32(colors, 24);
+	ca = _mm_packs_epi32(ca, ca);
+	a = nsvg__div255x8(_mm_mullo_epi16(cov, ca));
+
+	// Broadcast each alpha to its 4 channels: [a0 a0 a0 a0 a1 a1 a1 a1], [a2 .. a3 ..]
+	a = _mm_unpacklo_epi16(a, a);
+	alo = _mm_unpacklo_epi32(a, a);
+	ahi = _mm_unpackhi_epi32(a, a);
+
+	// Premultiply, using 255 as color alpha so that the alpha channel becomes 'a'
+	c = _mm_or_si128(colors, _mm_set1_epi32((int)0xff000000));
+	clo = nsvg__div255x8(_mm_mullo_epi16(_mm_unpacklo_epi8(c, zero), alo));
+	chi = nsvg__div255x8(_mm_mullo_epi16(_mm_unpackhi_epi8(c, zero), ahi));
+
+	// Blend over
+	d = _mm_loadu_si128((const __m128i*)dst);
+	ia = _mm_set1_epi16(255);
+	dlo = nsvg__div255x8(_mm_mullo_epi16(_mm_unpacklo_epi8(d, zero), _mm_sub_epi16(ia, alo)));
+	dhi = nsvg__div255x8(_mm_mullo_epi16(_mm_unpackhi_epi8(d, zero), _mm_sub_epi16(ia, ahi)));
+
+	_mm_storeu_si128((__m128i*)dst, _mm_packus_epi16(_mm_add_epi16(clo, dlo), _mm_add_epi16(chi, dhi)));
+}
+#endif
+
+// The coverage of a pixel is its partial coverage in 'cover' plus the running
+// sum of the span deltas in 'spans' (see nsvg__fillScanline()). Both are
+// cleared as they are consumed, so the next row starts from zero. The sum wraps
+// around like the per pixel unsigned char additions would.
+static inline int nsvg__coverage1(unsigned char* cover, int* spans, int* acc)
+{
+	int c;
+	*acc += *spans;
+	*spans = 0;
+	c = (unsigned char)(*cover + *acc);
+	*cover = 0;
+	return c;
+}
+
+#ifdef NSVG__SSE2
+// Inclusive prefix sum of 4 ints, offset by the running sum 'acc' (broadcast).
+// Returns the sums and updates 'acc' to the last one.
+static inline __m128i nsvg__prefixSum4(__m128i d, __m128i* acc)
+{
+	d = _mm_add_epi32(d, _mm_slli_si128(d, 4));
+	d = _mm_add_epi32(d, _mm_slli_si128(d, 8));
+	d = _mm_add_epi32(d, *acc);
+	*acc = _mm_shuffle_epi32(d, _MM_SHUFFLE(3, 3, 3, 3));
+	return d;
+}
+
+// Coverage of 4 pixels, one per byte (pixel 0 in the lowest byte).
+static inline unsigned int nsvg__coverage4(unsigned char* cover, int* spans, __m128i* acc)
+{
+	const __m128i zero = _mm_setzero_si128();
+	__m128i d = nsvg__prefixSum4(_mm_loadu_si128((const __m128i*)spans), acc);
+	int c;
+	_mm_storeu_si128((__m128i*)spans, zero);
+	// Keep the low byte of each sum (wrap around) and add the partial coverage.
+	d = _mm_and_si128(d, _mm_set1_epi32(0xff));
+	d = _mm_packs_epi32(d, d);
+	d = _mm_packus_epi16(d, d);
+	memcpy(&c, cover, 4);
+	memset(cover, 0, 4);
+	return (unsigned int)_mm_cvtsi128_si32(_mm_add_epi8(_mm_cvtsi32_si128(c), d));
+}
+#endif
+
+// Blends 'count' pixels, consuming and clearing their coverage (see nsvg__coverage1()).
 // Pixels with no coverage are skipped, the destination is unchanged for them.
-static void nsvg__scanlineSolid(unsigned char* dst, int count, unsigned char* cover, int x, int y,
+static void nsvg__scanlineSolid(unsigned char* dst, int count, unsigned char* cover, int* spans, int x, int y,
 								float tx, float ty, float scale, NSVGcachedPaint* cache)
 {
-	int i;
+	int i = 0, acc = 0;
+#ifdef NSVG__SSE2
+	__m128i vacc = _mm_setzero_si128();
+#endif
 
 	if (cache->type == NSVG_PAINT_COLOR) {
 		unsigned int c = cache->colors[0];
-		for (i = 0; i < count; i++) {
-			if (cover[i] != 0)
-				nsvg__blendPixel(dst, c, cover[i]);
+#ifdef NSVG__SSE2
+		__m128i colors = _mm_set1_epi32((int)c);
+		int opaque = (c >> 24) == 255;
+		for (; i + 4 <= count; i += 4) {
+			unsigned int cover4 = nsvg__coverage4(cover + i, spans + i, &vacc);
+			if (cover4 == 0) {
+				// No coverage, destination is unchanged.
+			} else if (cover4 == 0xffffffff && opaque) {
+				// Fully opaque, no blending needed.
+				_mm_storeu_si128((__m128i*)dst, colors);
+			} else {
+				nsvg__blend4(dst, colors, cover4);
+			}
+			dst += 16;
+		}
+		acc = _mm_cvtsi128_si32(vacc);
+#endif
+		for (; i < count; i++) {
+			int cov = nsvg__coverage1(cover + i, spans + i, &acc);
+			if (cov != 0)
+				nsvg__blendPixel(dst, c, cov);
 			dst += 4;
 		}
 	} else if (cache->type == NSVG_PAINT_LINEAR_GRADIENT) {
@@ -1069,10 +1181,32 @@ static void nsvg__scanlineSolid(unsigned char* dst, int count, unsigned char* co
 		fy = ((float)y - ty) / scale;
 		dx = 1.0f / scale;
 
-		for (i = 0; i < count; i++) {
-			if (cover[i] != 0) {
+#ifdef NSVG__SSE2
+		for (; i + 4 <= count; i += 4) {
+			unsigned int cover4 = nsvg__coverage4(cover + i, spans + i, &vacc), c[4];
+			int k;
+			if (cover4 != 0) {
+				for (k = 0; k < 4; k++) {
+					c[k] = 0;
+					if ((cover4 >> (k*8)) & 0xff) {
+						gy = fx*t[1] + fy*t[3] + t[5];
+						c[k] = cache->colors[(int)nsvg__clampf(gy*255.0f, 0, 255.0f)];
+					}
+					fx += dx;
+				}
+				nsvg__blend4(dst, _mm_loadu_si128((const __m128i*)c), cover4);
+			} else {
+				for (k = 0; k < 4; k++) fx += dx;
+			}
+			dst += 16;
+		}
+		acc = _mm_cvtsi128_si32(vacc);
+#endif
+		for (; i < count; i++) {
+			int cov = nsvg__coverage1(cover + i, spans + i, &acc);
+			if (cov != 0) {
 				gy = fx*t[1] + fy*t[3] + t[5];
-				nsvg__blendPixel(dst, cache->colors[(int)nsvg__clampf(gy*255.0f, 0, 255.0f)], cover[i]);
+				nsvg__blendPixel(dst, cache->colors[(int)nsvg__clampf(gy*255.0f, 0, 255.0f)], cov);
 			}
 			dst += 4;
 			fx += dx;
@@ -1087,12 +1221,36 @@ static void nsvg__scanlineSolid(unsigned char* dst, int count, unsigned char* co
 		fy = ((float)y - ty) / scale;
 		dx = 1.0f / scale;
 
-		for (i = 0; i < count; i++) {
-			if (cover[i] != 0) {
+#ifdef NSVG__SSE2
+		for (; i + 4 <= count; i += 4) {
+			unsigned int cover4 = nsvg__coverage4(cover + i, spans + i, &vacc), c[4];
+			int k;
+			if (cover4 != 0) {
+				for (k = 0; k < 4; k++) {
+					c[k] = 0;
+					if ((cover4 >> (k*8)) & 0xff) {
+						gx = fx*t[0] + fy*t[2] + t[4];
+						gy = fx*t[1] + fy*t[3] + t[5];
+						gd = sqrtf(gx*gx + gy*gy);
+						c[k] = cache->colors[(int)nsvg__clampf(gd*255.0f, 0, 255.0f)];
+					}
+					fx += dx;
+				}
+				nsvg__blend4(dst, _mm_loadu_si128((const __m128i*)c), cover4);
+			} else {
+				for (k = 0; k < 4; k++) fx += dx;
+			}
+			dst += 16;
+		}
+		acc = _mm_cvtsi128_si32(vacc);
+#endif
+		for (; i < count; i++) {
+			int cov = nsvg__coverage1(cover + i, spans + i, &acc);
+			if (cov != 0) {
 				gx = fx*t[0] + fy*t[2] + t[4];
 				gy = fx*t[1] + fy*t[3] + t[5];
 				gd = sqrtf(gx*gx + gy*gy);
-				nsvg__blendPixel(dst, cache->colors[(int)nsvg__clampf(gd*255.0f, 0, 255.0f)], cover[i]);
+				nsvg__blendPixel(dst, cache->colors[(int)nsvg__clampf(gd*255.0f, 0, 255.0f)], cov);
 			}
 			dst += 4;
 			fx += dx;
@@ -1100,18 +1258,6 @@ static void nsvg__scanlineSolid(unsigned char* dst, int count, unsigned char* co
 	}
 }
 
-// Adds the fully covered spans to the scanline coverage and clears the deltas.
-// Coverage wraps around like the per pixel unsigned char additions would.
-static void nsvg__accumulateSpans(unsigned char* scanline, int* spans, int xmin, int xmax)
-{
-	int x, acc = 0;
-	for (x = xmin; x <= xmax; x++) {
-		acc += spans[x];
-		spans[x] = 0;
-		scanline[x] = (unsigned char)(scanline[x] + acc);
-	}
-	spans[xmax+1] = 0;
-}
 
 static void nsvg__rasterizeSortedEdges(NSVGrasterizer *r, float tx, float ty, float scale, NSVGcachedPaint* cache, char fillRule)
 {
@@ -1205,23 +1351,61 @@ static void nsvg__rasterizeSortedEdges(NSVGrasterizer *r, float tx, float ty, fl
 		if (xmin < 0) xmin = 0;
 		if (xmax > r->width-1) xmax = r->width-1;
 		if (xmin <= xmax) {
-			nsvg__accumulateSpans(r->scanline, r->spans, xmin, xmax);
-			nsvg__scanlineSolid(&r->bitmap[y * r->stride] + xmin*4, xmax-xmin+1, &r->scanline[xmin], xmin, y, tx,ty, scale, cache);
+			// Blends and clears the coverage of [xmin, xmax].
+			nsvg__scanlineSolid(&r->bitmap[y * r->stride] + xmin*4, xmax-xmin+1, &r->scanline[xmin], &r->spans[xmin], xmin, y, tx,ty, scale, cache);
+			r->spans[xmax+1] = 0;
 			if (xmin < r->dirtyMinX) r->dirtyMinX = xmin;
 			if (xmax > r->dirtyMaxX) r->dirtyMaxX = xmax;
 			if (y < r->dirtyMinY) r->dirtyMinY = y;
 			if (y > r->dirtyMaxY) r->dirtyMaxY = y;
-			// Clear only the part of the scanline that was touched.
-			memset(&r->scanline[xmin], 0, xmax-xmin+1);
 		}
 	}
 
+}
+
+// Transparent pixels take the average color of their drawn neighbors, so that
+// filtering the image does not bleed black into the edges.
+static inline void nsvg__defringePixel(unsigned char* row, int x, int y, int w, int h, int stride)
+{
+	int r = 0, g = 0, b = 0, n = 0;
+	if (row[3] != 0)
+		return;
+	if (x > 0 && row[-1] != 0) {
+		r += row[-4];
+		g += row[-3];
+		b += row[-2];
+		n++;
+	}
+	if (x+1 < w && row[7] != 0) {
+		r += row[4];
+		g += row[5];
+		b += row[6];
+		n++;
+	}
+	if (y > 0 && row[-stride+3] != 0) {
+		r += row[-stride];
+		g += row[-stride+1];
+		b += row[-stride+2];
+		n++;
+	}
+	if (y+1 < h && row[stride+3] != 0) {
+		r += row[stride];
+		g += row[stride+1];
+		b += row[stride+2];
+		n++;
+	}
+	if (n > 0) {
+		row[0] = (unsigned char)(r/n);
+		row[1] = (unsigned char)(g/n);
+		row[2] = (unsigned char)(b/n);
+	}
 }
 
 static void nsvg__unpremultiplyAlpha(unsigned char* image, int w, int h, int stride,
 									 int x0, int y0, int x1, int y1)
 {
 	int x,y;
+	unsigned long long recip[256];
 
 	// Pixels outside of the drawn area are transparent and have no drawn
 	// neighbors, only process the drawn area and a one pixel border around it.
@@ -1231,15 +1415,46 @@ static void nsvg__unpremultiplyAlpha(unsigned char* image, int w, int h, int str
 	x1 = x1 < w - 1 ? x1 + 2 : w;
 	y1 = y1 < h - 1 ? y1 + 2 : h;
 
+	// c*255/a == (c*255*recip[a]) >> 24 for all c, a in [0,255], a > 0
+	// (verified exhaustively), avoids three integer divisions per pixel.
+	recip[0] = 0;
+	for (x = 1; x < 256; x++)
+		recip[x] = ((1ull << 24) + (unsigned)x - 1) / (unsigned)x;
+
 	// Unpremultiply
 	for (y = y0; y < y1; y++) {
 		unsigned char *row = &image[y*stride + x0*4];
-		for (x = x0; x < x1; x++) {
-			int r = row[0], g = row[1], b = row[2], a = row[3];
+		x = x0;
+#ifdef NSVG__SSE2
+		{
+			const __m128i alphaMask = _mm_set1_epi32((int)0xff000000);
+			for (; x + 4 <= x1; x += 4) {
+				// Skip blocks of 4 pixels which are all transparent or all opaque.
+				__m128i a = _mm_and_si128(_mm_loadu_si128((const __m128i*)row), alphaMask);
+				if (_mm_movemask_epi8(_mm_or_si128(_mm_cmpeq_epi32(a, _mm_setzero_si128()), _mm_cmpeq_epi32(a, alphaMask))) != 0xffff) {
+					int k;
+					for (k = 0; k < 4; k++) {
+						unsigned char* p = row + k*4;
+						int pa = p[3];
+						if (pa != 0 && pa != 255) {
+							unsigned long long m = recip[pa];
+							p[0] = (unsigned char)(((unsigned)p[0]*255u*m) >> 24);
+							p[1] = (unsigned char)(((unsigned)p[1]*255u*m) >> 24);
+							p[2] = (unsigned char)(((unsigned)p[2]*255u*m) >> 24);
+						}
+					}
+				}
+				row += 16;
+			}
+		}
+#endif
+		for (; x < x1; x++) {
+			int a = row[3];
 			if (a != 0 && a != 255) {
-				row[0] = (unsigned char)(r*255/a);
-				row[1] = (unsigned char)(g*255/a);
-				row[2] = (unsigned char)(b*255/a);
+				unsigned long long m = recip[a];
+				row[0] = (unsigned char)(((unsigned)row[0]*255u*m) >> 24);
+				row[1] = (unsigned char)(((unsigned)row[1]*255u*m) >> 24);
+				row[2] = (unsigned char)(((unsigned)row[2]*255u*m) >> 24);
 			}
 			row += 4;
 		}
@@ -1248,39 +1463,46 @@ static void nsvg__unpremultiplyAlpha(unsigned char* image, int w, int h, int str
 	// Defringe
 	for (y = y0; y < y1; y++) {
 		unsigned char *row = &image[y*stride + x0*4];
-		for (x = x0; x < x1; x++) {
-			int r = 0, g = 0, b = 0, a = row[3], n = 0;
-			if (a == 0) {
-				if (x > 0 && row[-1] != 0) {
-					r += row[-4];
-					g += row[-3];
-					b += row[-2];
-					n++;
+		x = x0;
+#ifdef NSVG__SSE2
+		{
+			const __m128i alphaMask = _mm_set1_epi32((int)0xff000000);
+			const __m128i zero = _mm_setzero_si128();
+			for (; x + 4 <= x1; x += 4) {
+				// Only transparent pixels next to drawn pixels change, skip blocks
+				// of 4 pixels without transparent pixels, and fully transparent
+				// blocks whose neighbors are all transparent too.
+				__m128i a = _mm_and_si128(_mm_loadu_si128((const __m128i*)row), alphaMask);
+				int transparent = _mm_movemask_epi8(_mm_cmpeq_epi32(a, zero));
+				int k;
+				if (transparent == 0) {
+					row += 16;
+					continue;
 				}
-				if (x+1 < w && row[7] != 0) {
-					r += row[4];
-					g += row[5];
-					b += row[6];
-					n++;
+				if (transparent == 0xffff) {
+					int drawn = (x > 0 && row[-1] != 0) || (x+4 < w && row[19] != 0);
+					if (!drawn && y > 0) {
+						a = _mm_and_si128(_mm_loadu_si128((const __m128i*)(row - stride)), alphaMask);
+						drawn = _mm_movemask_epi8(_mm_cmpeq_epi32(a, zero)) != 0xffff;
+					}
+					if (!drawn && y+1 < h) {
+						a = _mm_and_si128(_mm_loadu_si128((const __m128i*)(row + stride)), alphaMask);
+						drawn = _mm_movemask_epi8(_mm_cmpeq_epi32(a, zero)) != 0xffff;
+					}
+					if (!drawn) {
+						row += 16;
+						continue;
+					}
 				}
-				if (y > 0 && row[-stride+3] != 0) {
-					r += row[-stride];
-					g += row[-stride+1];
-					b += row[-stride+2];
-					n++;
-				}
-				if (y+1 < h && row[stride+3] != 0) {
-					r += row[stride];
-					g += row[stride+1];
-					b += row[stride+2];
-					n++;
-				}
-				if (n > 0) {
-					row[0] = (unsigned char)(r/n);
-					row[1] = (unsigned char)(g/n);
-					row[2] = (unsigned char)(b/n);
+				for (k = 0; k < 4; k++) {
+					nsvg__defringePixel(row, x+k, y, w, h, stride);
+					row += 4;
 				}
 			}
+		}
+#endif
+		for (; x < x1; x++) {
+			nsvg__defringePixel(row, x, y, w, h, stride);
 			row += 4;
 		}
 	}
