@@ -144,6 +144,7 @@ struct NSVGrasterizer
 	NSVGmemPage* curpage;
 
 	unsigned char* scanline;
+	int* spans;			// coverage deltas of the fully covered spans, cscanline+1 entries
 	int cscanline;
 	int dirtyMinX, dirtyMinY, dirtyMaxX, dirtyMaxY;	// bounds of the pixels drawn
 
@@ -184,6 +185,7 @@ void nsvgDeleteRasterizer(NSVGrasterizer* r)
 	if (r->points) free(r->points);
 	if (r->points2) free(r->points2);
 	if (r->scanline) free(r->scanline);
+	if (r->spans) free(r->spans);
 
 	free(r);
 }
@@ -904,7 +906,10 @@ static void nsvg__freeActive(NSVGrasterizer* r, NSVGactiveEdge* z)
 	r->freelist = z;
 }
 
-static void nsvg__fillScanline(unsigned char* scanline, int len, int x0, int x1, int maxWeight, int* xmin, int* xmax)
+// Partial coverage at the span ends is added to 'scanline', fully covered pixels
+// between them are recorded as start/end deltas in 'spans' and accumulated
+// once per pixel row, see nsvg__accumulateSpans().
+static void nsvg__fillScanline(unsigned char* scanline, int* spans, int len, int x0, int x1, int maxWeight, int* xmin, int* xmax)
 {
 	int i = x0 >> NSVG__FIXSHIFT;
 	int j = x1 >> NSVG__FIXSHIFT;
@@ -925,8 +930,10 @@ static void nsvg__fillScanline(unsigned char* scanline, int len, int x0, int x1,
 			else
 				j = len; // clip
 
-			for (++i; i < j; ++i) // fill pixels between x0 and x1
-				scanline[i] = (unsigned char)(scanline[i] + maxWeight);
+			if (++i < j) { // fill pixels between x0 and x1
+				spans[i] += maxWeight;
+				spans[j] -= maxWeight;
+			}
 		}
 	}
 }
@@ -934,7 +941,7 @@ static void nsvg__fillScanline(unsigned char* scanline, int len, int x0, int x1,
 // note: this routine clips fills that extend off the edges... ideally this
 // wouldn't happen, but it could happen if the truetype glyph bounding boxes
 // are wrong, or if the user supplies a too-small bitmap
-static void nsvg__fillActiveEdges(unsigned char* scanline, int len, NSVGactiveEdge* e, int maxWeight, int* xmin, int* xmax, char fillRule)
+static void nsvg__fillActiveEdges(unsigned char* scanline, int* spans, int len, NSVGactiveEdge* e, int maxWeight, int* xmin, int* xmax, char fillRule)
 {
 	// non-zero winding fill
 	int x0 = 0, w = 0;
@@ -949,7 +956,7 @@ static void nsvg__fillActiveEdges(unsigned char* scanline, int len, NSVGactiveEd
 				int x1 = e->x; w += e->dir;
 				// if we went to zero, we need to draw
 				if (w == 0)
-					nsvg__fillScanline(scanline, len, x0, x1, maxWeight, xmin, xmax);
+					nsvg__fillScanline(scanline, spans, len, x0, x1, maxWeight, xmin, xmax);
 			}
 			e = e->next;
 		}
@@ -961,7 +968,7 @@ static void nsvg__fillActiveEdges(unsigned char* scanline, int len, NSVGactiveEd
 				x0 = e->x; w = 1;
 			} else {
 				int x1 = e->x; w = 0;
-				nsvg__fillScanline(scanline, len, x0, x1, maxWeight, xmin, xmax);
+				nsvg__fillScanline(scanline, spans, len, x0, x1, maxWeight, xmin, xmax);
 			}
 			e = e->next;
 		}
@@ -1148,6 +1155,19 @@ static void nsvg__scanlineSolid(unsigned char* dst, int count, unsigned char* co
 	}
 }
 
+// Adds the fully covered spans to the scanline coverage and clears the deltas.
+// Coverage wraps around like the per pixel unsigned char additions would.
+static void nsvg__accumulateSpans(unsigned char* scanline, int* spans, int xmin, int xmax)
+{
+	int x, acc = 0;
+	for (x = xmin; x <= xmax; x++) {
+		acc += spans[x];
+		spans[x] = 0;
+		scanline[x] = (unsigned char)(scanline[x] + acc);
+	}
+	spans[xmax+1] = 0;
+}
+
 static void nsvg__rasterizeSortedEdges(NSVGrasterizer *r, float tx, float ty, float scale, NSVGcachedPaint* cache, char fillRule)
 {
 	NSVGactiveEdge *active = NULL;
@@ -1163,6 +1183,7 @@ static void nsvg__rasterizeSortedEdges(NSVGrasterizer *r, float tx, float ty, fl
 	if (ystart < 0) ystart = 0;
 
 	memset(r->scanline, 0, r->width);
+	memset(r->spans, 0, (r->width+1) * sizeof(int));
 
 	for (y = ystart; y < r->height; y++) {
 		// Stop once all edges have been processed.
@@ -1233,12 +1254,13 @@ static void nsvg__rasterizeSortedEdges(NSVGrasterizer *r, float tx, float ty, fl
 
 			// now process all active edges in non-zero fashion
 			if (active != NULL)
-				nsvg__fillActiveEdges(r->scanline, r->width, active, maxWeight, &xmin, &xmax, fillRule);
+				nsvg__fillActiveEdges(r->scanline, r->spans, r->width, active, maxWeight, &xmin, &xmax, fillRule);
 		}
 		// Blit
 		if (xmin < 0) xmin = 0;
 		if (xmax > r->width-1) xmax = r->width-1;
 		if (xmin <= xmax) {
+			nsvg__accumulateSpans(r->scanline, r->spans, xmin, xmax);
 			nsvg__scanlineSolid(&r->bitmap[y * r->stride] + xmin*4, xmax-xmin+1, &r->scanline[xmin], xmin, y, tx,ty, scale, cache);
 			if (xmin < r->dirtyMinX) r->dirtyMinX = xmin;
 			if (xmax > r->dirtyMaxX) r->dirtyMaxX = xmax;
@@ -1438,9 +1460,14 @@ void nsvgRasterize(NSVGrasterizer* r,
 	r->stride = stride;
 
 	if (w > r->cscanline) {
+		unsigned char* scanline = (unsigned char*)realloc(r->scanline, w);
+		int* spans;
+		if (scanline == NULL) return;
+		r->scanline = scanline;
+		spans = (int*)realloc(r->spans, (w+1) * sizeof(int));
+		if (spans == NULL) return;
+		r->spans = spans;
 		r->cscanline = w;
-		r->scanline = (unsigned char*)realloc(r->scanline, w);
-		if (r->scanline == NULL) return;
 	}
 
 	for (i = 0; i < h; i++)
