@@ -145,6 +145,7 @@ struct NSVGrasterizer
 
 	unsigned char* scanline;
 	int cscanline;
+	int dirtyMinX, dirtyMinY, dirtyMaxX, dirtyMaxY;	// bounds of the pixels drawn
 
 	unsigned char* bitmap;
 	int width, height, stride;
@@ -360,6 +361,16 @@ static void nsvg__flattenCubicBez(NSVGrasterizer* r,
 	if ((d2 + d3)*(d2 + d3) < r->tessTol * (dx*dx + dy*dy)) {
 		nsvg__addPathPoint(r, x4, y4, type);
 		return;
+	}
+
+	// The flatness test above can never pass when the end points coincide,
+	// use the distance of the control points from the end point instead.
+	if (dx*dx + dy*dy < r->distTol*r->distTol) {
+		float ex2 = x2 - x4, ey2 = y2 - y4, ex3 = x3 - x4, ey3 = y3 - y4;
+		if (ex2*ex2 + ey2*ey2 + ex3*ex3 + ey3*ey3 < r->tessTol) {
+			nsvg__addPathPoint(r, x4, y4, type);
+			return;
+		}
 	}
 
 	x234 = (x23+x34)*0.5f;
@@ -1005,9 +1016,25 @@ static void nsvg__scanlineSolid(unsigned char* dst, int count, unsigned char* co
 		ca = (cache->colors[0] >> 24) & 0xff;
 
 		for (i = 0; i < count; i++) {
-			int r,g,b;
-			int a = nsvg__div255((int)cover[0] * ca);
-			int ia = 255 - a;
+			int r,g,b,a,ia;
+			if (cover[0] == 0) {
+				// No coverage, destination is unchanged.
+				cover++;
+				dst += 4;
+				continue;
+			}
+			a = nsvg__div255((int)cover[0] * ca);
+			if (a == 255) {
+				// Fully opaque, no blending needed.
+				dst[0] = (unsigned char)cr;
+				dst[1] = (unsigned char)cg;
+				dst[2] = (unsigned char)cb;
+				dst[3] = 255;
+				cover++;
+				dst += 4;
+				continue;
+			}
+			ia = 255 - a;
 			// Premultiply
 			r = nsvg__div255(cr * a);
 			g = nsvg__div255(cg * a);
@@ -1127,10 +1154,19 @@ static void nsvg__rasterizeSortedEdges(NSVGrasterizer *r, float tx, float ty, fl
 	int y, s;
 	int e = 0;
 	int maxWeight = (255 / NSVG__SUBSAMPLES);  // weight per vertical scanline
-	int xmin, xmax;
+	int xmin, xmax, ystart;
 
-	for (y = 0; y < r->height; y++) {
-		memset(r->scanline, 0, r->width);
+	if (r->nedges == 0) return;
+
+	// Edges are sorted by y0, skip the rows above the first edge.
+	ystart = (int)floorf(r->edges[0].y0 / NSVG__SUBSAMPLES);
+	if (ystart < 0) ystart = 0;
+
+	memset(r->scanline, 0, r->width);
+
+	for (y = ystart; y < r->height; y++) {
+		// Stop once all edges have been processed.
+		if (active == NULL && e >= r->nedges) break;
 		xmin = r->width;
 		xmax = 0;
 		for (s = 0; s < NSVG__SUBSAMPLES; ++s) {
@@ -1204,21 +1240,36 @@ static void nsvg__rasterizeSortedEdges(NSVGrasterizer *r, float tx, float ty, fl
 		if (xmax > r->width-1) xmax = r->width-1;
 		if (xmin <= xmax) {
 			nsvg__scanlineSolid(&r->bitmap[y * r->stride] + xmin*4, xmax-xmin+1, &r->scanline[xmin], xmin, y, tx,ty, scale, cache);
+			if (xmin < r->dirtyMinX) r->dirtyMinX = xmin;
+			if (xmax > r->dirtyMaxX) r->dirtyMaxX = xmax;
+			if (y < r->dirtyMinY) r->dirtyMinY = y;
+			if (y > r->dirtyMaxY) r->dirtyMaxY = y;
+			// Clear only the part of the scanline that was touched.
+			memset(&r->scanline[xmin], 0, xmax-xmin+1);
 		}
 	}
 
 }
 
-static void nsvg__unpremultiplyAlpha(unsigned char* image, int w, int h, int stride)
+static void nsvg__unpremultiplyAlpha(unsigned char* image, int w, int h, int stride,
+									 int x0, int y0, int x1, int y1)
 {
 	int x,y;
 
+	// Pixels outside of the drawn area are transparent and have no drawn
+	// neighbors, only process the drawn area and a one pixel border around it.
+	if (x0 > x1 || y0 > y1) return;
+	x0 = x0 > 0 ? x0 - 1 : 0;
+	y0 = y0 > 0 ? y0 - 1 : 0;
+	x1 = x1 < w - 1 ? x1 + 2 : w;
+	y1 = y1 < h - 1 ? y1 + 2 : h;
+
 	// Unpremultiply
-	for (y = 0; y < h; y++) {
-		unsigned char *row = &image[y*stride];
-		for (x = 0; x < w; x++) {
+	for (y = y0; y < y1; y++) {
+		unsigned char *row = &image[y*stride + x0*4];
+		for (x = x0; x < x1; x++) {
 			int r = row[0], g = row[1], b = row[2], a = row[3];
-			if (a != 0) {
+			if (a != 0 && a != 255) {
 				row[0] = (unsigned char)(r*255/a);
 				row[1] = (unsigned char)(g*255/a);
 				row[2] = (unsigned char)(b*255/a);
@@ -1228,9 +1279,9 @@ static void nsvg__unpremultiplyAlpha(unsigned char* image, int w, int h, int str
 	}
 
 	// Defringe
-	for (y = 0; y < h; y++) {
-		unsigned char *row = &image[y*stride];
-		for (x = 0; x < w; x++) {
+	for (y = y0; y < y1; y++) {
+		unsigned char *row = &image[y*stride + x0*4];
+		for (x = x0; x < x1; x++) {
 			int r = 0, g = 0, b = 0, a = row[3], n = 0;
 			if (a == 0) {
 				if (x-1 > 0 && row[-1] != 0) {
@@ -1395,6 +1446,11 @@ void nsvgRasterize(NSVGrasterizer* r,
 	for (i = 0; i < h; i++)
 		memset(&dst[i*stride], 0, w*4);
 
+	r->dirtyMinX = w;
+	r->dirtyMinY = h;
+	r->dirtyMaxX = -1;
+	r->dirtyMaxY = -1;
+
 	for (shape = image->shapes; shape != NULL; shape = shape->next) {
 		if (!(shape->flags & NSVG_FLAGS_VISIBLE))
 			continue;
@@ -1453,7 +1509,7 @@ void nsvgRasterize(NSVGrasterizer* r,
 		}
 	}
 
-	nsvg__unpremultiplyAlpha(dst, w, h, stride);
+	nsvg__unpremultiplyAlpha(dst, w, h, stride, r->dirtyMinX, r->dirtyMinY, r->dirtyMaxX, r->dirtyMaxY);
 
 	r->bitmap = NULL;
 	r->width = 0;
