@@ -1011,144 +1011,89 @@ static inline int nsvg__div255(int x)
     return ((x+1) * 257) >> 16;
 }
 
+// Blends color 'c' with coverage 'cover' (1..255) over a premultiplied pixel.
+static inline void nsvg__blendPixel(unsigned char* dst, unsigned int c, int cover)
+{
+	int r, g, b, ia;
+	int cr = c & 0xff;
+	int cg = (c >> 8) & 0xff;
+	int cb = (c >> 16) & 0xff;
+	int a = nsvg__div255(cover * (int)((c >> 24) & 0xff));
+
+	if (a == 255) {
+		// Fully opaque, no blending needed.
+		dst[0] = (unsigned char)cr;
+		dst[1] = (unsigned char)cg;
+		dst[2] = (unsigned char)cb;
+		dst[3] = 255;
+		return;
+	}
+	ia = 255 - a;
+
+	// Premultiply
+	r = nsvg__div255(cr * a);
+	g = nsvg__div255(cg * a);
+	b = nsvg__div255(cb * a);
+
+	// Blend over
+	r += nsvg__div255(ia * (int)dst[0]);
+	g += nsvg__div255(ia * (int)dst[1]);
+	b += nsvg__div255(ia * (int)dst[2]);
+	a += nsvg__div255(ia * (int)dst[3]);
+
+	dst[0] = (unsigned char)r;
+	dst[1] = (unsigned char)g;
+	dst[2] = (unsigned char)b;
+	dst[3] = (unsigned char)a;
+}
+
+// Pixels with no coverage are skipped, the destination is unchanged for them.
 static void nsvg__scanlineSolid(unsigned char* dst, int count, unsigned char* cover, int x, int y,
 								float tx, float ty, float scale, NSVGcachedPaint* cache)
 {
+	int i;
 
 	if (cache->type == NSVG_PAINT_COLOR) {
-		int i, cr, cg, cb, ca;
-		cr = cache->colors[0] & 0xff;
-		cg = (cache->colors[0] >> 8) & 0xff;
-		cb = (cache->colors[0] >> 16) & 0xff;
-		ca = (cache->colors[0] >> 24) & 0xff;
-
+		unsigned int c = cache->colors[0];
 		for (i = 0; i < count; i++) {
-			int r,g,b,a,ia;
-			if (cover[0] == 0) {
-				// No coverage, destination is unchanged.
-				cover++;
-				dst += 4;
-				continue;
-			}
-			a = nsvg__div255((int)cover[0] * ca);
-			if (a == 255) {
-				// Fully opaque, no blending needed.
-				dst[0] = (unsigned char)cr;
-				dst[1] = (unsigned char)cg;
-				dst[2] = (unsigned char)cb;
-				dst[3] = 255;
-				cover++;
-				dst += 4;
-				continue;
-			}
-			ia = 255 - a;
-			// Premultiply
-			r = nsvg__div255(cr * a);
-			g = nsvg__div255(cg * a);
-			b = nsvg__div255(cb * a);
-
-			// Blend over
-			r += nsvg__div255(ia * (int)dst[0]);
-			g += nsvg__div255(ia * (int)dst[1]);
-			b += nsvg__div255(ia * (int)dst[2]);
-			a += nsvg__div255(ia * (int)dst[3]);
-
-			dst[0] = (unsigned char)r;
-			dst[1] = (unsigned char)g;
-			dst[2] = (unsigned char)b;
-			dst[3] = (unsigned char)a;
-
-			cover++;
+			if (cover[i] != 0)
+				nsvg__blendPixel(dst, c, cover[i]);
 			dst += 4;
 		}
 	} else if (cache->type == NSVG_PAINT_LINEAR_GRADIENT) {
 		// TODO: spread modes.
-		// TODO: plenty of opportunities to optimize.
 		float fx, fy, dx, gy;
 		float* t = cache->xform;
-		int i, cr, cg, cb, ca;
-		unsigned int c;
 
 		fx = ((float)x - tx) / scale;
 		fy = ((float)y - ty) / scale;
 		dx = 1.0f / scale;
 
 		for (i = 0; i < count; i++) {
-			int r,g,b,a,ia;
-			gy = fx*t[1] + fy*t[3] + t[5];
-			c = cache->colors[(int)nsvg__clampf(gy*255.0f, 0, 255.0f)];
-			cr = (c) & 0xff;
-			cg = (c >> 8) & 0xff;
-			cb = (c >> 16) & 0xff;
-			ca = (c >> 24) & 0xff;
-
-			a = nsvg__div255((int)cover[0] * ca);
-			ia = 255 - a;
-
-			// Premultiply
-			r = nsvg__div255(cr * a);
-			g = nsvg__div255(cg * a);
-			b = nsvg__div255(cb * a);
-
-			// Blend over
-			r += nsvg__div255(ia * (int)dst[0]);
-			g += nsvg__div255(ia * (int)dst[1]);
-			b += nsvg__div255(ia * (int)dst[2]);
-			a += nsvg__div255(ia * (int)dst[3]);
-
-			dst[0] = (unsigned char)r;
-			dst[1] = (unsigned char)g;
-			dst[2] = (unsigned char)b;
-			dst[3] = (unsigned char)a;
-
-			cover++;
+			if (cover[i] != 0) {
+				gy = fx*t[1] + fy*t[3] + t[5];
+				nsvg__blendPixel(dst, cache->colors[(int)nsvg__clampf(gy*255.0f, 0, 255.0f)], cover[i]);
+			}
 			dst += 4;
 			fx += dx;
 		}
 	} else if (cache->type == NSVG_PAINT_RADIAL_GRADIENT) {
 		// TODO: spread modes.
-		// TODO: plenty of opportunities to optimize.
 		// TODO: focus (fx,fy)
 		float fx, fy, dx, gx, gy, gd;
 		float* t = cache->xform;
-		int i, cr, cg, cb, ca;
-		unsigned int c;
 
 		fx = ((float)x - tx) / scale;
 		fy = ((float)y - ty) / scale;
 		dx = 1.0f / scale;
 
 		for (i = 0; i < count; i++) {
-			int r,g,b,a,ia;
-			gx = fx*t[0] + fy*t[2] + t[4];
-			gy = fx*t[1] + fy*t[3] + t[5];
-			gd = sqrtf(gx*gx + gy*gy);
-			c = cache->colors[(int)nsvg__clampf(gd*255.0f, 0, 255.0f)];
-			cr = (c) & 0xff;
-			cg = (c >> 8) & 0xff;
-			cb = (c >> 16) & 0xff;
-			ca = (c >> 24) & 0xff;
-
-			a = nsvg__div255((int)cover[0] * ca);
-			ia = 255 - a;
-
-			// Premultiply
-			r = nsvg__div255(cr * a);
-			g = nsvg__div255(cg * a);
-			b = nsvg__div255(cb * a);
-
-			// Blend over
-			r += nsvg__div255(ia * (int)dst[0]);
-			g += nsvg__div255(ia * (int)dst[1]);
-			b += nsvg__div255(ia * (int)dst[2]);
-			a += nsvg__div255(ia * (int)dst[3]);
-
-			dst[0] = (unsigned char)r;
-			dst[1] = (unsigned char)g;
-			dst[2] = (unsigned char)b;
-			dst[3] = (unsigned char)a;
-
-			cover++;
+			if (cover[i] != 0) {
+				gx = fx*t[0] + fy*t[2] + t[4];
+				gy = fx*t[1] + fy*t[3] + t[5];
+				gd = sqrtf(gx*gx + gy*gy);
+				nsvg__blendPixel(dst, cache->colors[(int)nsvg__clampf(gd*255.0f, 0, 255.0f)], cover[i]);
+			}
 			dst += 4;
 			fx += dx;
 		}
