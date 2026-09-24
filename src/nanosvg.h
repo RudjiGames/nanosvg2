@@ -227,7 +227,8 @@ void nsvgDelete(NSVGimage* image);
 
 static int nsvg__isspace(char c)
 {
-	return strchr(" \t\n\v\f\r", c) != 0;
+	// Same set as strchr(" \t\n\v\f\r", c) != 0, which includes '\0'.
+	return c == ' ' || (c >= '\t' && c <= '\r') || c == '\0';
 }
 
 static int nsvg__isdigit(char c)
@@ -1146,12 +1147,32 @@ error:
 }
 
 // We roll our own string to float because the std library one uses locale and messes things up.
+// Powers of ten that are exactly representable as doubles, and their
+// correctly rounded inverses (identical to pow(10.0, n) for |n| <= 22).
+static const double nsvg__pow10[] = {
+	1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11,
+	1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22
+};
+static const double nsvg__pow10neg[] = {
+	1e0, 1e-1, 1e-2, 1e-3, 1e-4, 1e-5, 1e-6, 1e-7, 1e-8, 1e-9, 1e-10, 1e-11,
+	1e-12, 1e-13, 1e-14, 1e-15, 1e-16, 1e-17, 1e-18, 1e-19, 1e-20, 1e-21, 1e-22
+};
+
+static double nsvg__powTen(long n)
+{
+	if (n >= 0 && n <= 22) return nsvg__pow10[n];
+	if (n < 0 && n >= -22) return nsvg__pow10neg[-n];
+	return pow(10.0, (double)n);
+}
+
+// Maximum number of digits accumulated into a 64 bit integer without overflow.
+#define NSVG__MAX_INT_DIGITS 18
+#define NSVG__MAX_INT_VALUE 100000000000000000LL	// 1e17, one more digit still fits
+
 static double nsvg__atof(const char* s)
 {
-	char* cur = (char*)s;
-	char* end = NULL;
+	const char* cur = s;
 	double res = 0.0, sign = 1.0;
-	long long intPart = 0, fracPart = 0;
 	char hasIntPart = 0, hasFracPart = 0;
 
 	// Parse optional sign
@@ -1164,26 +1185,38 @@ static double nsvg__atof(const char* s)
 
 	// Parse integer part
 	if (nsvg__isdigit(*cur)) {
-		// Parse digit sequence
-		intPart = strtoll(cur, &end, 10);
-		if (cur != end) {
-			res = (double)intPart;
-			hasIntPart = 1;
-			cur = end;
+		long long intPart = 0;
+		int ndigits = 0;
+		while (nsvg__isdigit(*cur) && ndigits < NSVG__MAX_INT_DIGITS) {
+			intPart = intPart * 10 + (*cur - '0');
+			ndigits++;
+			cur++;
 		}
+		res = (double)intPart;
+		// Very long integer parts continue in floating point.
+		while (nsvg__isdigit(*cur)) {
+			res = res * 10.0 + (double)(*cur - '0');
+			cur++;
+		}
+		hasIntPart = 1;
 	}
 
 	// Parse fractional part.
 	if (*cur == '.') {
 		cur++; // Skip '.'
 		if (nsvg__isdigit(*cur)) {
-			// Parse digit sequence
-			fracPart = strtoll(cur, &end, 10);
-			if (cur != end) {
-				res += (double)fracPart / pow(10.0, (double)(end - cur));
-				hasFracPart = 1;
-				cur = end;
+			long long fracPart = 0;
+			long ndigits = 0;
+			// Leading zeros do not count towards the significant digits.
+			while (nsvg__isdigit(*cur) && fracPart < NSVG__MAX_INT_VALUE) {
+				fracPart = fracPart * 10 + (*cur - '0');
+				ndigits++;
+				cur++;
 			}
+			// Digits beyond double precision are ignored.
+			while (nsvg__isdigit(*cur)) cur++;
+			res += (double)fracPart / nsvg__powTen(ndigits);
+			hasFracPart = 1;
 		}
 	}
 
@@ -1193,11 +1226,12 @@ static double nsvg__atof(const char* s)
 
 	// Parse optional exponent
 	if (*cur == 'e' || *cur == 'E') {
+		char* end = NULL;
 		long expPart = 0;
 		cur++; // skip 'E'
 		expPart = strtol(cur, &end, 10); // Parse digit sequence with sign
 		if (cur != end) {
-			res *= pow(10.0, (double)expPart);
+			res *= nsvg__powTen(expPart);
 		}
 	}
 
@@ -1279,13 +1313,32 @@ static const char* nsvg__getNextPathItem(const char* s, char* it)
 	return s;
 }
 
+static int nsvg__hexValue(char c)
+{
+	if (c >= '0' && c <= '9') return c - '0';
+	if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+	if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+	return -1;
+}
+
 static unsigned int nsvg__parseColorHex(const char* str)
 {
-	unsigned int r=0, g=0, b=0;
-	if (sscanf(str, "#%2x%2x%2x", &r, &g, &b) == 3 )		// 2 digit hex
+	int i, n = 0, d[6];
+	str++; // skip '#'
+	while (n < 6 && (d[n] = nsvg__hexValue(str[n])) >= 0) n++;
+	if (n >= 5) {
+		// 2 digit hex, the last component may have only one digit
+		// (same as sscanf "#%2x%2x%2x").
+		unsigned int r = (unsigned int)(d[0]*16 + d[1]);
+		unsigned int g = (unsigned int)(d[2]*16 + d[3]);
+		unsigned int b = (n == 6) ? (unsigned int)(d[4]*16 + d[5]) : (unsigned int)d[4];
 		return NSVG_RGB(r, g, b);
-	if (sscanf(str, "#%1x%1x%1x", &r, &g, &b) == 3 )		// 1 digit hex, e.g. #abc -> 0xccbbaa
-		return NSVG_RGB(r*17, g*17, b*17);			// same effect as (r<<4|r), (g<<4|g), ..
+	}
+	if (n >= 3) {
+		// 1 digit hex, e.g. #abc -> 0xccbbaa, same effect as (r<<4|r), (g<<4|g), ..
+		for (i = 0; i < 3; i++) d[i] *= 17;
+		return NSVG_RGB(d[0], d[1], d[2]);
+	}
 	return NSVG_RGB(128, 128, 128);
 }
 
